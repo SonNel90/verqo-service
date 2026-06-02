@@ -36,13 +36,6 @@ import {
 
 // ── Clients ──────────────────────────────────────────────────────────────────
 
-import ws from "ws";
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY,
-  { global: { fetch }, realtime: { transport: ws } }
-);
-
 const account = privateKeyToAccount(process.env.DEPLOYER_PRIVATE_KEY);
 
 const publicClient = createPublicClient({
