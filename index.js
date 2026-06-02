@@ -1,11 +1,7 @@
 /**
  * index.js — Verqo Service entry point
- * Runs on Render (always-on). Polls every 60s to:
- * 1. Deploy markets for new battles that don't have one yet
- * 2. Resolve battles that have ended
- *
- * Also exposes a minimal HTTP server so Render doesn't kill the process
- * (Render expects a web service to listen on a port)
+ * - Polls every 60s to deploy markets + resolve ended battles
+ * - Exposes HTTP endpoints for Supabase webhooks
  */
 
 import "dotenv/config";
@@ -15,29 +11,49 @@ import { run as resolveMarkets } from "./resolveMarkets.js";
 
 const PORT = process.env.PORT || 3000;
 
-// ── Minimal HTTP server (keeps Render happy) ──────────────────────────────────
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ status: "ok", service: "verqo-service", time: new Date().toISOString() }));
+// ── HTTP server ───────────────────────────────────────────────────────────────
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+
+  // Health check
+  if (req.method === "GET" && url.pathname === "/") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "ok", service: "verqo-service", time: new Date().toISOString() }));
+    return;
+  }
+
+  // Supabase webhook: new battle inserted → deploy its market immediately
+  if (req.method === "POST" && url.pathname === "/deploy") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ received: true }));
+    // Run deploy in background (don't await — webhook needs fast response)
+    console.log(`[WEBHOOK] /deploy triggered at ${new Date().toISOString()}`);
+    deployMarkets().catch(e => console.error("webhook deployMarkets error:", e.message));
+    return;
+  }
+
+  // Supabase webhook: battle updated → check if needs resolving
+  if (req.method === "POST" && url.pathname === "/resolve") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ received: true }));
+    console.log(`[WEBHOOK] /resolve triggered at ${new Date().toISOString()}`);
+    resolveMarkets().catch(e => console.error("webhook resolveMarkets error:", e.message));
+    return;
+  }
+
+  res.writeHead(404);
+  res.end("Not found");
 });
 
 server.listen(PORT, () => {
   console.log(`Verqo service running on port ${PORT}`);
 });
 
-// ── Main polling loop ─────────────────────────────────────────────────────────
+// ── Polling loop (backup — runs even if webhooks miss something) ──────────────
 async function tick() {
-  console.log(`\n[${new Date().toISOString()}] Running tick...`);
-  try {
-    await deployMarkets();
-  } catch (e) {
-    console.error("deployMarkets error:", e.message);
-  }
-  try {
-    await resolveMarkets();
-  } catch (e) {
-    console.error("resolveMarkets error:", e.message);
-  }
+  console.log(`\n[${new Date().toISOString()}] Polling tick...`);
+  try { await deployMarkets(); } catch (e) { console.error("deployMarkets error:", e.message); }
+  try { await resolveMarkets(); } catch (e) { console.error("resolveMarkets error:", e.message); }
 }
 
 // Run immediately on startup, then every 60 seconds
