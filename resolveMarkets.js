@@ -10,11 +10,7 @@
 
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY,
-  { realtime: { enabled: false } }
-);
+import ws from "ws";
 import {
   createWalletClient,
   createPublicClient,
@@ -27,6 +23,12 @@ import { baseSepolia } from "viem/chains";
 import { ADDRESSES, conditionalTokensAbi } from "./contracts.js";
 
 // ── Clients ───────────────────────────────────────────────────────────────────
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY,
+  { global: { fetch }, realtime: { transport: ws } }
+);
 
 const account = privateKeyToAccount(process.env.DEPLOYER_PRIVATE_KEY);
 
