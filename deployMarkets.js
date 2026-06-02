@@ -215,12 +215,16 @@ async function run() {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-const watchMode = process.argv.includes("--watch");
+export { run };
 
-if (watchMode) {
-  console.log("Watch mode: running every 60 seconds...");
-  run();
-  setInterval(run, 60_000);
-} else {
-  run();
+// Allow direct execution
+if (process.argv[1] === new URL(import.meta.url).pathname) {
+  const watchMode = process.argv.includes("--watch");
+  if (watchMode) {
+    console.log("Watch mode: running every 60 seconds...");
+    run();
+    setInterval(run, 60_000);
+  } else {
+    run();
+  }
 }
