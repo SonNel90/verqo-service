@@ -78,15 +78,25 @@ async function deployMarketForBattle(battle) {
   // prepareCondition is safe to call twice but wastes gas — skip if already done
   // We detect by checking if conditionId exists (payoutDenominator returns 0 for unprepared too,
   // so we just always prepare — the contract ignores duplicates gracefully)
+  // prepareCondition is idempotent on-chain but reverts if already prepared.
+  // Catch that specific revert and continue — condition is ready either way.
   console.log("  Preparing condition...");
-  const prepHash = await walletClient.writeContract({
-    address: ADDRESSES.conditionalTokens,
-    abi: conditionalTokensAbi,
-    functionName: "prepareCondition",
-    args: [account.address, questionId, 2n],
-  });
-  await publicClient.waitForTransactionReceipt({ hash: prepHash });
-  console.log(`  ✓ Condition prepared (tx: ${prepHash})`);
+  try {
+    const prepHash = await walletClient.writeContract({
+      address: ADDRESSES.conditionalTokens,
+      abi: conditionalTokensAbi,
+      functionName: "prepareCondition",
+      args: [account.address, questionId, 2n],
+    });
+    await publicClient.waitForTransactionReceipt({ hash: prepHash });
+    console.log(`  ✓ Condition prepared (tx: ${prepHash})`);
+  } catch (e) {
+    if (/already prepared|already exists/i.test(e.message || "")) {
+      console.log("  ✓ Condition already prepared — skipping");
+    } else {
+      throw e; // real error, rethrow
+    }
+  }
 
   // 4. Mint funding USDC to deployer wallet (testnet — open mint)
   console.log(`  Minting ${INITIAL_FUNDING} USDC for funding...`);
