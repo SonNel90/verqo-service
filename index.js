@@ -8,6 +8,7 @@ import "dotenv/config";
 import http from "http";
 import { run as deployMarkets } from "./deployMarkets.js";
 import { run as resolveMarkets } from "./resolveMarkets.js";
+import { run as runPredictions } from "./predictions.js";
 
 const PORT = process.env.PORT || 3000;
 
@@ -29,6 +30,15 @@ const server = http.createServer(async (req, res) => {
     // Run deploy in background (don't await — webhook needs fast response)
     console.log(`[WEBHOOK] /deploy triggered at ${new Date().toISOString()}`);
     deployMarkets().catch(e => console.error("webhook deployMarkets error:", e.message));
+    return;
+  }
+
+  // Supabase webhook: new prediction inserted → deploy its market immediately
+  if (req.method === "POST" && url.pathname === "/predictions-deploy") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ received: true }));
+    console.log(`[WEBHOOK] /predictions-deploy triggered at ${new Date().toISOString()}`);
+    runPredictions().catch(e => console.error("webhook runPredictions error:", e.message));
     return;
   }
 
@@ -54,6 +64,7 @@ async function tick() {
   console.log(`\n[${new Date().toISOString()}] Polling tick...`);
   try { await deployMarkets(); } catch (e) { console.error("deployMarkets error:", e.message); }
   try { await resolveMarkets(); } catch (e) { console.error("resolveMarkets error:", e.message); }
+  try { await runPredictions(); } catch (e) { console.error("predictions error:", e.message); }
 }
 
 // Run immediately on startup, then every 60 seconds

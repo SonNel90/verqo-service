@@ -63,28 +63,58 @@ async function resolveBattle(battle) {
     console.log("  Already resolved on-chain — skipping");
     // Still update Supabase winner if missing
     if (!battle.winner) {
-      const winner = (battle.score_a ?? 0) >= (battle.score_b ?? 0) ? "A" : "B";
+      // Derive the label from the on-chain payouts we can read, not from
+      // possibly-NULL scores. If scores exist, use them; else mark TIE.
+      let winner = "TIE";
+      if (battle.score_a != null && battle.score_b != null) {
+        winner = battle.score_a > battle.score_b ? "A" : battle.score_b > battle.score_a ? "B" : "TIE";
+      }
       await supabase.from("battles").update({ winner, status: "SETTLED" }).eq("id", battle.id);
     }
     return;
   }
 
   // Determine winner from scores
-  const scoreA = battle.score_a ?? 0;
-  const scoreB = battle.score_b ?? 0;
-  let payouts, winner;
+// Determine winner from scores — but only if scores actually exist.
+  // NULL scores must NOT be treated as 0 (that would wrongly force a split
+  // whenever the scoring oracle is down).
+  const rawA = battle.score_a;
+  const rawB = battle.score_b;
+  const scoresReady =
+    rawA !== null && rawA !== undefined &&
+    rawB !== null && rawB !== undefined;
 
-  if (scoreA > scoreB) {
-    payouts = [1n, 0n]; // outcome 0 (creator A) wins
-    winner = "A";
-  } else if (scoreB > scoreA) {
-    payouts = [0n, 1n]; // outcome 1 (creator B) wins
-    winner = "B";
-  } else {
-    // Tie — split evenly
+  const GRACE_MS = 48 * 60 * 60 * 1000; // 48h after end before a refund-split
+  const endedAt = new Date(battle.ends_at).getTime();
+  const pastGrace = Date.now() - endedAt > GRACE_MS;
+
+  if (!scoresReady && !pastGrace) {
+    console.log(`  ⏳ scores not ready, within 48h grace — skipping (will retry)`);
+    return; // leave winner NULL; a later run resolves it once scores arrive
+  }
+
+  let payouts, winner;
+  if (!scoresReady) {
+    // Past grace with no scores — refund-split so funds aren't trapped forever.
+    console.log(`  ⚠ scores never arrived, past 48h grace — refund-split`);
     payouts = [1n, 1n];
     winner = "TIE";
+  } else {
+    const scoreA = rawA;
+    const scoreB = rawB;
+    if (scoreA > scoreB) {
+      payouts = [1n, 0n]; // outcome 0 (creator A) wins
+      winner = "A";
+    } else if (scoreB > scoreA) {
+      payouts = [0n, 1n]; // outcome 1 (creator B) wins
+      winner = "B";
+    } else {
+      payouts = [1n, 1n]; // genuine tie on real scores
+      winner = "TIE";
+    }
   }
+
+  console.log(`  Winner: ${winner} | Payouts: [${payouts.join(", ")}]`);
 
   console.log(`  Winner: ${winner} | Payouts: [${payouts.join(", ")}]`);
 
