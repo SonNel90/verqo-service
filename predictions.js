@@ -1,19 +1,22 @@
 /**
- * predictions.js — Phase A: user-created prediction markets
+ * predictions.js — Phase A.5: launch-pool edition
  *
- * Job 1 (deployPredictions): finds rows in `predictions` with status
- *   LAUNCHING, deploys a condition + LMSR market for each (same flow as
- *   deployMarkets.js uses for battles), writes back question_id /
- *   condition_id / market_address, and flips status → LIVE.
+ * The old v1 funded every market directly. Now user-created markets go
+ * through the VerqoLaunchPool bootstrap:
  *
- * Job 2 (checkResolvedPredictions): finds LIVE predictions and checks the
- *   chain — once the oracle wallet has called reportPayouts (from the
- *   frontend resolve panel), payoutDenominator > 0. The service then reads
- *   which outcome won and flips status → RESOLVED with the outcome saved.
+ *   1. createLaunches():   new DB row (LAUNCHING, no launch_id) →
+ *                          pool.createLaunch(questionId, deadline) →
+ *                          save launch_id + question_id.
+ *   2. superviseLaunches(): for each LAUNCHING row with a launch_id:
+ *        - threshold reached on-chain → call pool.graduate() →
+ *          save market_address + condition_id, flip status → LIVE
+ *        - deadline passed without graduating → flip status → INVALID
+ *          (depositors self-serve refunds via claimRefund)
+ *   3. checkResolvedPredictions(): LIVE rows whose condition the oracle
+ *      wallet has resolved → flip status → RESOLVED + outcome, then call
+ *      pool.settle() so LP claims unlock immediately.
  *
- * Deliberately self-contained: duplicates the deploy steps from
- * deployMarkets.js rather than modifying that working file. If the deploy
- * flow ever changes, change it in both places.
+ * Self-contained on purpose — contracts.js stays untouched.
  */
 
 import "dotenv/config";
@@ -25,32 +28,29 @@ import {
   http,
   keccak256,
   encodePacked,
+  decodeEventLog,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { baseSepolia } from "viem/chains";
-import {
-  ADDRESSES,
-  factoryAbi,
-  conditionalTokensAbi,
-  mockUsdcAbi,
-  FEE_2PCT,
-  INITIAL_FUNDING,
-} from "./contracts.js";
+import { ADDRESSES, conditionalTokensAbi } from "./contracts.js";
 
-// payoutNumerators isn't in contracts.js — declared locally so that file
-// stays untouched.
-const payoutNumeratorsAbi = [
-  {
-    name: "payoutNumerators",
-    type: "function",
-    stateMutability: "view",
-    inputs: [
-      { name: "conditionId", type: "bytes32" },
-      { name: "index", type: "uint256" },
-    ],
-    outputs: [{ type: "uint256" }],
-  },
+// ── VerqoLaunchPool (deployed 2026-07-14, Base Sepolia) ─────────────────────
+const LAUNCH_POOL = "0x4490fc42C128340eBaa3a9F86e49FF8e38DCa9e7";
+
+const launchPoolAbi = [
+  { name: "createLaunch", type: "function", stateMutability: "nonpayable", inputs: [{ name: "questionId", type: "bytes32" }, { name: "deadline", type: "uint64" }], outputs: [{ type: "uint256" }] },
+  { name: "graduate", type: "function", stateMutability: "nonpayable", inputs: [{ name: "launchId", type: "uint256" }], outputs: [] },
+  { name: "settle", type: "function", stateMutability: "nonpayable", inputs: [{ name: "launchId", type: "uint256" }], outputs: [] },
+  { name: "launchInfo", type: "function", stateMutability: "view", inputs: [{ name: "launchId", type: "uint256" }], outputs: [{ name: "status", type: "uint8" }, { name: "totalDeposits", type: "uint256" }, { name: "threshold", type: "uint256" }, { name: "deadline", type: "uint64" }, { name: "market", type: "address" }, { name: "payoutPool", type: "uint256" }] },
+  { name: "LaunchCreated", type: "event", inputs: [{ name: "launchId", type: "uint256", indexed: true }, { name: "questionId", type: "bytes32", indexed: false }, { name: "deadline", type: "uint64", indexed: false }] },
 ];
+
+const payoutNumeratorsAbi = [
+  { name: "payoutNumerators", type: "function", stateMutability: "view", inputs: [{ name: "conditionId", type: "bytes32" }, { name: "index", type: "uint256" }], outputs: [{ type: "uint256" }] },
+];
+
+// Pool status enum: 0 NONE, 1 LAUNCHING, 2 GRADUATED, 3 SETTLED, 4 FAILED
+const POOL = { LAUNCHING: 1, GRADUATED: 2, SETTLED: 3, FAILED: 4 };
 
 // ── Clients (same setup as deployMarkets.js, incl. the ws transport fix) ────
 const supabase = createClient(
@@ -58,196 +58,142 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY,
   { global: { fetch }, realtime: { transport: ws } }
 );
-
 const account = privateKeyToAccount(process.env.DEPLOYER_PRIVATE_KEY);
+const publicClient = createPublicClient({ chain: baseSepolia, transport: http(process.env.RPC_URL || "https://sepolia.base.org") });
+const walletClient = createWalletClient({ account, chain: baseSepolia, transport: http(process.env.RPC_URL || "https://sepolia.base.org") });
 
-const publicClient = createPublicClient({
-  chain: baseSepolia,
-  transport: http(process.env.RPC_URL || "https://sepolia.base.org"),
-});
-
-const walletClient = createWalletClient({
-  account,
-  chain: baseSepolia,
-  transport: http(process.env.RPC_URL || "https://sepolia.base.org"),
-});
-
-// ── Deploy one prediction market ─────────────────────────────────────────────
-async function deployMarketForPrediction(p) {
-  console.log(`\n▶ [PREDICTION] Deploying market for prediction ${p.id}: "${p.question}"`);
-
-  // 1. Unique questionId — NOTE the prediction-specific prefix, so a
-  //    prediction can never collide with a battle's questionId.
-  const questionId = keccak256(
-    encodePacked(["string"], [`verqo-prediction-${p.id}`])
-  );
-  console.log(`  questionId: ${questionId}`);
-
-  // 2. Deterministic conditionId
-  const conditionId = await publicClient.readContract({
-    address: ADDRESSES.conditionalTokens,
-    abi: conditionalTokensAbi,
-    functionName: "getConditionId",
-    args: [account.address, questionId, 2n],
-  });
-  console.log(`  conditionId: ${conditionId}`);
-
-  // 3. Prepare condition (idempotent — reverts if already prepared)
-  console.log("  Preparing condition...");
-  try {
-    const prepHash = await walletClient.writeContract({
-      address: ADDRESSES.conditionalTokens,
-      abi: conditionalTokensAbi,
-      functionName: "prepareCondition",
-      args: [account.address, questionId, 2n],
-    });
-    await publicClient.waitForTransactionReceipt({ hash: prepHash });
-    console.log(`  ✓ Condition prepared (tx: ${prepHash})`);
-  } catch (e) {
-    if (/already prepared|already exists/i.test(e.message || "")) {
-      console.log("  ✓ Condition already prepared — skipping");
-    } else {
-      throw e;
-    }
-  }
-
-  // 4. Mint funding USDC (testnet open mint)
-  console.log(`  Minting ${INITIAL_FUNDING} USDC for funding...`);
-  const mintHash = await walletClient.writeContract({
-    address: ADDRESSES.mockUsdc,
-    abi: mockUsdcAbi,
-    functionName: "mint",
-    args: [account.address, INITIAL_FUNDING],
-  });
-  await publicClient.waitForTransactionReceipt({ hash: mintHash });
-
-  // 5. Approve factory
-  console.log("  Approving USDC for factory...");
-  const approveHash = await walletClient.writeContract({
-    address: ADDRESSES.mockUsdc,
-    abi: mockUsdcAbi,
-    functionName: "approve",
-    args: [ADDRESSES.lmsrFactory, INITIAL_FUNDING],
-  });
-  await publicClient.waitForTransactionReceipt({ hash: approveHash });
-
-  // 6. Create the LMSR market
-  console.log("  Creating LMSR market...");
-  const createHash = await walletClient.writeContract({
-    address: ADDRESSES.lmsrFactory,
-    abi: factoryAbi,
-    functionName: "createLMSRMarketMaker",
-    args: [
-      ADDRESSES.conditionalTokens,
-      ADDRESSES.mockUsdc,
-      [conditionId],
-      FEE_2PCT,
-      "0x0000000000000000000000000000000000000000",
-      INITIAL_FUNDING,
-    ],
-  });
-  const createReceipt = await publicClient.waitForTransactionReceipt({ hash: createHash });
-  console.log(`  ✓ Market created (tx: ${createHash})`);
-
-  // 7. Extract the new market address from the receipt (same two-step
-  //    detection as deployMarkets.js)
-  const EVENT_SIG = "0x6867cd3ddf1a2f1ce80923be4ebe91b6cdab90ef2266e1b5c38c3e509ad0d8f8";
-  let marketAddress = null;
-  for (const log of createReceipt.logs) {
-    if (log.topics[0]?.toLowerCase() === EVENT_SIG.toLowerCase()) {
-      const raw = log.data.slice(2);
-      marketAddress = "0x" + raw.slice(24, 64);
-      break;
-    }
-  }
-  if (!marketAddress) {
-    const AMMCreated = "0x631ac92e0a879a687b1bd27a7dcbf3ec0be307aa0a1046c0df4109be02c49307";
-    for (const log of createReceipt.logs) {
-      if (log.topics[0]?.toLowerCase() === AMMCreated.toLowerCase()) {
-        marketAddress = log.address;
-        break;
-      }
-    }
-  }
-  if (!marketAddress) throw new Error("Could not find market address in receipt logs");
-  console.log(`  ✓ Market address: ${marketAddress}`);
-
-  // 8. Write back + flip LAUNCHING → LIVE
-  const { error } = await supabase
-    .from("predictions")
-    .update({
-      question_id: questionId,
-      condition_id: conditionId,
-      market_address: marketAddress,
-      status: "LIVE",
-    })
-    .eq("id", p.id);
-  if (error) throw new Error(`Supabase update failed: ${error.message}`);
-  console.log("  ✓ Saved to Supabase — prediction is LIVE");
-
-  return { marketAddress, conditionId };
-}
-
-// ── Job 1: deploy all LAUNCHING predictions ──────────────────────────────────
-async function deployPredictions() {
+// ── 1. Register new predictions as launches ──────────────────────────────────
+async function createLaunches() {
   const { data: rows, error } = await supabase
     .from("predictions")
-    .select("id, question, ends_at, status")
+    .select("id, question, ends_at")
     .eq("status", "LAUNCHING")
-    .is("market_address", null);
+    .is("launch_id", null);
+  if (error) return console.error("[LAUNCH] fetch error:", error.message);
+  if (!rows?.length) return;
 
-  if (error) {
-    console.error("[PREDICTION] Supabase fetch error:", error.message);
-    return;
-  }
-  if (!rows || rows.length === 0) return;
-
-  console.log(`[PREDICTION] ${rows.length} market(s) to deploy.`);
+  console.log(`[LAUNCH] ${rows.length} launch(es) to register on-chain.`);
   for (const p of rows) {
-    // Expired before we ever deployed it? Don't put a dead market on-chain.
-    if (new Date(p.ends_at).getTime() <= Date.now()) {
-      console.log(`[PREDICTION] ${p.id} expired before deploy — marking INVALID.`);
-      await supabase.from("predictions").update({ status: "INVALID" }).eq("id", p.id);
-      continue;
-    }
     try {
-      await deployMarketForPrediction(p);
+      const deadline = BigInt(Math.floor(new Date(p.ends_at).getTime() / 1000));
+      // Contract requires deadline > now + 30 min; the API enforces ≥ 1h,
+      // but guard against clock drift anyway.
+      if (deadline <= BigInt(Math.floor(Date.now() / 1000)) + 1800n) {
+        console.log(`[LAUNCH] ${p.id} deadline too soon — marking INVALID.`);
+        await supabase.from("predictions").update({ status: "INVALID" }).eq("id", p.id);
+        continue;
+      }
+      const questionId = keccak256(encodePacked(["string"], [`verqo-prediction-${p.id}`]));
+      console.log(`▶ [LAUNCH] createLaunch for prediction ${p.id}: "${p.question}"`);
+      const hash = await walletClient.writeContract({
+        address: LAUNCH_POOL, abi: launchPoolAbi, functionName: "createLaunch",
+        args: [questionId, deadline],
+      });
+      const receipt = await publicClient.waitForTransactionReceipt({ hash });
+      if (receipt.status !== "success") throw new Error("createLaunch tx failed");
+
+      // Pull the launchId from the LaunchCreated event
+      let launchId = null;
+      for (const log of receipt.logs) {
+        if (log.address.toLowerCase() !== LAUNCH_POOL.toLowerCase()) continue;
+        try {
+          const ev = decodeEventLog({ abi: launchPoolAbi, data: log.data, topics: log.topics });
+          if (ev.eventName === "LaunchCreated") { launchId = ev.args.launchId; break; }
+        } catch { /* not our event */ }
+      }
+      if (launchId === null) throw new Error("LaunchCreated event not found in receipt");
+
+      const { error: upErr } = await supabase
+        .from("predictions")
+        .update({ question_id: questionId, launch_id: Number(launchId) })
+        .eq("id", p.id);
+      if (upErr) throw new Error(upErr.message);
+      console.log(`  ✓ launch ${launchId} registered (tx: ${hash})`);
     } catch (e) {
-      console.error(`✗ [PREDICTION] Failed for ${p.id}:`, e.message);
+      console.error(`✗ [LAUNCH] createLaunch failed for ${p.id}:`, e.message);
     }
   }
 }
 
-// ── Job 2: detect on-chain resolutions of LIVE predictions ───────────────────
+// ── 2. Graduate full pools / invalidate expired ones ─────────────────────────
+async function superviseLaunches() {
+  const { data: rows, error } = await supabase
+    .from("predictions")
+    .select("id, launch_id, ends_at")
+    .eq("status", "LAUNCHING")
+    .not("launch_id", "is", null);
+  if (error) return console.error("[LAUNCH] fetch error:", error.message);
+  if (!rows?.length) return;
+
+  for (const p of rows) {
+    try {
+      const info = await publicClient.readContract({
+        address: LAUNCH_POOL, abi: launchPoolAbi, functionName: "launchInfo",
+        args: [BigInt(p.launch_id)],
+      });
+      const [status, totalDeposits, threshold] = info;
+      const market = info[4];
+
+      if (Number(status) === POOL.LAUNCHING && totalDeposits >= threshold) {
+        console.log(`▶ [LAUNCH] ${p.launch_id} hit threshold — graduating...`);
+        const hash = await walletClient.writeContract({
+          address: LAUNCH_POOL, abi: launchPoolAbi, functionName: "graduate",
+          args: [BigInt(p.launch_id)],
+        });
+        const r = await publicClient.waitForTransactionReceipt({ hash });
+        if (r.status !== "success") throw new Error("graduate tx failed");
+        console.log(`  ✓ graduated (tx: ${hash})`);
+        continue; // next tick reads the fresh state and records the market
+      }
+
+      if (Number(status) === POOL.GRADUATED && market !== "0x0000000000000000000000000000000000000000") {
+        // conditionId is deterministic: oracle = this wallet, 2 outcomes
+        const questionId = keccak256(encodePacked(["string"], [`verqo-prediction-${p.id}`]));
+        const conditionId = await publicClient.readContract({
+          address: ADDRESSES.conditionalTokens, abi: conditionalTokensAbi,
+          functionName: "getConditionId", args: [account.address, questionId, 2n],
+        });
+        const { error: upErr } = await supabase
+          .from("predictions")
+          .update({ market_address: market, condition_id: conditionId, status: "LIVE" })
+          .eq("id", p.id);
+        if (upErr) throw new Error(upErr.message);
+        console.log(`[LAUNCH] ${p.launch_id} recorded LIVE — market ${market}`);
+        continue;
+      }
+
+      // Deadline passed, never graduated → INVALID (refunds self-serve on-chain)
+      if (new Date(p.ends_at).getTime() <= Date.now() && Number(status) === POOL.LAUNCHING) {
+        await supabase.from("predictions").update({ status: "INVALID" }).eq("id", p.id);
+        console.log(`[LAUNCH] ${p.launch_id} expired below threshold — INVALID (refunds open).`);
+      }
+    } catch (e) {
+      console.error(`✗ [LAUNCH] supervise failed for ${p.id}:`, e.message);
+    }
+  }
+}
+
+// ── 3. Detect oracle resolutions → RESOLVED, then settle the pool ────────────
 async function checkResolvedPredictions() {
   const { data: rows, error } = await supabase
     .from("predictions")
-    .select("id, condition_id, status")
+    .select("id, condition_id, launch_id")
     .eq("status", "LIVE")
     .not("condition_id", "is", null);
-
-  if (error) {
-    console.error("[PREDICTION] Supabase fetch error:", error.message);
-    return;
-  }
-  if (!rows || rows.length === 0) return;
+  if (error) return console.error("[PREDICTION] fetch error:", error.message);
+  if (!rows?.length) return;
 
   for (const p of rows) {
     try {
       const denom = await publicClient.readContract({
-        address: ADDRESSES.conditionalTokens,
-        abi: conditionalTokensAbi,
-        functionName: "payoutDenominator",
-        args: [p.condition_id],
+        address: ADDRESSES.conditionalTokens, abi: conditionalTokensAbi,
+        functionName: "payoutDenominator", args: [p.condition_id],
       });
-      if (denom === 0n) continue; // not resolved yet
+      if (denom === 0n) continue;
 
-      // Which outcome won? index 0 = YES, index 1 = NO
       const pay0 = await publicClient.readContract({
-        address: ADDRESSES.conditionalTokens,
-        abi: payoutNumeratorsAbi,
-        functionName: "payoutNumerators",
-        args: [p.condition_id, 0n],
+        address: ADDRESSES.conditionalTokens, abi: payoutNumeratorsAbi,
+        functionName: "payoutNumerators", args: [p.condition_id, 0n],
       });
       const outcome = pay0 === denom ? 0 : 1;
 
@@ -256,15 +202,29 @@ async function checkResolvedPredictions() {
         .update({ status: "RESOLVED", outcome, resolved_at: new Date().toISOString() })
         .eq("id", p.id);
       if (upErr) throw new Error(upErr.message);
-      console.log(`[PREDICTION] ${p.id} resolved on-chain → outcome ${outcome === 0 ? "YES" : "NO"}.`);
+      console.log(`[PREDICTION] ${p.id} resolved → ${outcome === 0 ? "YES" : "NO"} won.`);
+
+      // Unlock LP claims right away (idempotent: reverts once settled — ignored)
+      if (p.launch_id != null) {
+        try {
+          const hash = await walletClient.writeContract({
+            address: LAUNCH_POOL, abi: launchPoolAbi, functionName: "settle",
+            args: [BigInt(p.launch_id)],
+          });
+          await publicClient.waitForTransactionReceipt({ hash });
+          console.log(`  ✓ launch ${p.launch_id} settled — LP claims open (tx: ${hash})`);
+        } catch (e) {
+          if (!/not graduated/i.test(e.message || "")) console.error(`  settle failed for ${p.launch_id}:`, e.message);
+        }
+      }
     } catch (e) {
       console.error(`✗ [PREDICTION] resolve-check failed for ${p.id}:`, e.message);
     }
   }
 }
 
-// ── Entry ─────────────────────────────────────────────────────────────────────
 export async function run() {
-  await deployPredictions();
+  await createLaunches();
+  await superviseLaunches();
   await checkResolvedPredictions();
 }
