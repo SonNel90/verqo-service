@@ -33,6 +33,14 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Health check — 200 for uptime pingers (keeps the free instance awake
+  // AND turns the status page green)
+  if (req.method === "GET" && url.pathname === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, ts: new Date().toISOString() }));
+    return;
+  }
+
   // Supabase webhook: new prediction inserted → deploy its market immediately
   if (req.method === "POST" && url.pathname === "/predictions-deploy") {
     res.writeHead(200, { "Content-Type": "application/json" });
