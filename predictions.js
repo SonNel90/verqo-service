@@ -195,14 +195,19 @@ async function checkResolvedPredictions() {
         address: ADDRESSES.conditionalTokens, abi: payoutNumeratorsAbi,
         functionName: "payoutNumerators", args: [p.condition_id, 0n],
       });
-      const outcome = pay0 === denom ? 0 : 1;
+      const pay1 = await publicClient.readContract({
+        address: ADDRESSES.conditionalTokens, abi: payoutNumeratorsAbi,
+        functionName: "payoutNumerators", args: [p.condition_id, 1n],
+      });
+      // [1,0]=YES(0) · [0,1]=NO(1) · [1,1]=SPLIT(2, every share pays 50c)
+      const outcome = pay0 === pay1 ? 2 : pay0 === denom ? 0 : 1;
 
       const { error: upErr } = await supabase
         .from("predictions")
         .update({ status: "RESOLVED", outcome, resolved_at: new Date().toISOString() })
         .eq("id", p.id);
       if (upErr) throw new Error(upErr.message);
-      console.log(`[PREDICTION] ${p.id} resolved → ${outcome === 0 ? "YES" : "NO"} won.`);
+      console.log(`[PREDICTION] ${p.id} resolved → ${outcome === 2 ? "SPLIT 50/50" : outcome === 0 ? "YES won" : "NO won"}.`);
 
       // Unlock LP claims right away (idempotent: reverts once settled — ignored)
       if (p.launch_id != null) {
