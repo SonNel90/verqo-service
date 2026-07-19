@@ -52,7 +52,7 @@ export async function run() {
         .limit(1);
 
       const prev = last?.[0];
-      const moved = !prev || Math.abs(Number(prev.yes_price) - yes) >= 0.5;
+      const moved = !prev || Math.abs(Number(prev.yes_price) - yes) >= 0.1;
       const stale = !prev || Date.now() - new Date(prev.created_at).getTime() > 15 * 60 * 1000;
       if (!moved && !stale) continue;
 

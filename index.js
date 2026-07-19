@@ -42,6 +42,16 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Instant price snapshot — the frontend pings this right after every
+  // confirmed trade, so the chart gets a point within seconds of the fill
+  // (and the ping itself wakes a sleeping free-tier instance).
+  if (url.pathname === "/snap") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+    runPriceHistory().catch(e => console.error("snap error:", e.message));
+    return;
+  }
+
   // Supabase webhook: new prediction inserted → deploy its market immediately
   if (req.method === "POST" && url.pathname === "/predictions-deploy") {
     res.writeHead(200, { "Content-Type": "application/json" });
