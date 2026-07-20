@@ -10,6 +10,7 @@ import { run as deployMarkets } from "./deployMarkets.js";
 import { run as resolveMarkets } from "./resolveMarkets.js";
 import { run as runPredictions } from "./predictions.js";
 import { run as runPriceHistory } from "./priceHistory.js";
+import { run as runLeaderboard } from "./leaderboard.js";
 
 const PORT = process.env.PORT || 3000;
 
@@ -85,6 +86,7 @@ async function tick() {
   try { await resolveMarkets(); } catch (e) { console.error("resolveMarkets error:", e.message); }
   try { await runPredictions(); } catch (e) { console.error("predictions error:", e.message); }
   try { await runPriceHistory(); } catch (e) { console.error("priceHistory error:", e.message); }
+  try { await runLeaderboard(); } catch (e) { console.error("leaderboard error:", e.message); }
 }
 
 // Run immediately on startup, then every 60 seconds
