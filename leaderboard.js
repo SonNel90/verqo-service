@@ -13,9 +13,13 @@ import ws from "ws";
 import { createPublicClient, http, parseAbi, formatUnits } from "viem";
 import { baseSepolia } from "viem/chains";
 
-const LAUNCH_POOL = "0x4490fc42C128340eBaa3a9F86e49FF8e38DCa9e7";
-const CHUNK = 10000n;          // blocks per getLogs call
-const MAX_CHUNKS_PER_TICK = 20; // bound runtime per tick
+const V1_POOL = "0x4490fc42C128340eBaa3a9F86e49FF8e38DCa9e7";
+const V2_POOL = "0x1648015321d7D948BA48afb590C2484Ce94A9Cd4";
+// V2 launch ids are namespaced +1,000,000 in lp_balances so the two pools'
+// launch counters can never collide.
+const V2_OFFSET = 1000000;
+const CHUNK = 1000n;           // Base public RPC caps eth_getLogs ranges (~1k blocks)
+const MAX_CHUNKS_PER_TICK = 30; // bound runtime per tick
 const LOOKBACK = 600000n;      // first-run history window (~2 weeks of Base blocks)
 
 const supabase = createClient(
@@ -55,9 +59,11 @@ export async function run() {
     let to = from;
     while (from <= latest && scanned < MAX_CHUNKS_PER_TICK) {
       to = from + CHUNK - 1n > latest ? latest : from + CHUNK - 1n;
-      const logs = await publicClient.getLogs({ address: LAUNCH_POOL, events: poolEvents, fromBlock: from, toBlock: to });
+      const logs = await publicClient.getLogs({ address: [V1_POOL, V2_POOL], events: poolEvents, fromBlock: from, toBlock: to });
       for (const log of logs) {
-        const { launchId, user } = log.args;
+        const isV2 = log.address.toLowerCase() === V2_POOL.toLowerCase();
+        const launchId = Number(log.args.launchId) + (isV2 ? V2_OFFSET : 0);
+        const user = log.args.user;
         if (log.eventName === "Deposited") bump(launchId, user, u(log.args.credited));
         else if (log.eventName === "Withdrawn") bump(launchId, user, -(u(log.args.returned) + u(log.args.skim)));
         else if (log.eventName === "Refunded") bump(launchId, user, 0, true);   // full exit
